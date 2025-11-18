@@ -3,12 +3,20 @@ from tkinter import ttk
 import queue
 from collections import deque
 import threading, time, random, requests
+import win32gui
+import win32process
+import mss
+import mss.tools
+from PIL import Image
+import io
+import base64
 
 
 WINDOW_WIDTH = 420
 WINDOW_HEIGHT = 700
-DEBUG_SCREENSHOT = False
+DEBUG_SCREENSHOT = True
 HISTORY_LEN = 20
+SCREENSHOT_INTERVAL = 3
 
 
 
@@ -38,11 +46,8 @@ PERSONALITIES = [
     "You're the streamer's biggest fan. Be overly enthusiastic and positive. Hype up everything they do, no matter how small. Use lots of encouraging emojis.",
 ]
 
-def llm_generate_line(recent_chat):
-    """
-    Chiede a LM Studio di generare un singolo messaggio Twitch-style.
-    """
-    # Scegli una personalità a caso
+def llm_generate_line(recent_chat, current_username, screenshot_b64=None):
+    
     personality = random.choice(PERSONALITIES)
     
     system_prompt = (
@@ -58,20 +63,41 @@ def llm_generate_line(recent_chat):
     else:
         chat_text = "(no chat yet)"
 
-    user_prompt = (
-        f"Here's the RECENT_CHAT on a programming stream:\n{chat_text}\n\n"
-        "Write a new message based on your personality and the chat vibe. Follow the rules."
-    )
+    last_3_msgs = list(recent_chat)[-3:] if len(recent_chat) >= 3 else list(recent_chat)
+    mod_count = sum(1 for msg in last_3_msgs if "MODERATOR:" in msg)
+    
+    extra_instruction = ""
+    if mod_count > 0 and random.random() < 0.5:
+        extra_instruction = " Pay attention to what the MODERATOR said and react to it."
+    elif len(last_3_msgs) >= 2:
+        last_user = last_3_msgs[-1].split(":")[0] if ":" in last_3_msgs[-1] else ""
+        if last_user == current_username:
+            extra_instruction = " DO NOT reply to yourself. Talk about something completely different."
 
+    if screenshot_b64:
+        user_content = [
+            {
+                "type": "text",
+                "text": f"Here's the RECENT_CHAT on a programming stream:\n{chat_text}\n\nYou are {current_username}. You can also see the streamer's screen. React to what you see in the code or what others are saying.{extra_instruction}"
+            },
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": screenshot_b64
+                }
+            }
+        ]
+    else:
+        user_content = f"Here's the RECENT_CHAT on a programming stream:\n{chat_text}\n\nYou are {current_username}. Write a new message based on your personality.{extra_instruction}"
 
     payload = {
         "model": MODEL,
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
+            {"role": "user", "content": user_content}
         ],
         "temperature": TEMPERATURE,
-        "stream": False
+        "stream": False 
     }
 
     try:
@@ -83,6 +109,50 @@ def llm_generate_line(recent_chat):
         return f"(error calling LLM: {e})"
 
 
+def find_vscode_window():
+    vscode_hwnd = None
+
+    def enum_handler(hwnd, _):
+        nonlocal vscode_hwnd
+        if win32gui.IsWindowVisible(hwnd):
+            title = win32gui.GetWindowText(hwnd)
+            if "Visual Studio Code" in title or "Code" in title:
+                vscode_hwnd = hwnd
+
+    win32gui.EnumWindows(enum_handler, None)
+    return vscode_hwnd
+
+
+def screenshot_vscode():
+    hwnd = find_vscode_window()
+    if not hwnd:
+        return None, None
+
+    # Ottieni bounding box della finestra
+    rect = win32gui.GetWindowRect(hwnd)
+    left, top, right, bottom = rect
+
+    w = right - left
+    h = bottom - top
+
+    # Cattura solo quella regione
+    with mss.mss() as sct:
+        monitor = {
+            "left": left,
+            "top": top,
+            "width": w,
+            "height": h,
+        }
+        sct_img = sct.grab(monitor)
+        img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+
+        # Convert to base64 PNG in-memory
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        buf.close()
+
+        return f"data:image/png;base64,{b64}", img
 
 class TwitchChatUI:
     def __init__(self, root):
@@ -130,6 +200,8 @@ class TwitchChatUI:
         # Stato interno
         self.msg_queue = queue.Queue()
         self.recent_chat = deque(maxlen=HISTORY_LEN)
+        self.last_screenshot = None
+        self.screenshot_counter = 0
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -164,9 +236,20 @@ class TwitchChatUI:
         """Loop che genera messaggi periodici dal modello."""
         while getattr(self, "running", False):
             try:
-                # Chiamata al modello
-                line = llm_generate_line(list(self.recent_chat))
+                self.screenshot_counter += 1
+                
+                screenshot_b64 = None
+                if DEBUG_SCREENSHOT and self.screenshot_counter >= SCREENSHOT_INTERVAL:
+                    self.screenshot_counter = 0
+                    screenshot_b64, _ = screenshot_vscode()
+                    if screenshot_b64:
+                        self.last_screenshot = screenshot_b64
+                
+                if not screenshot_b64 and self.last_screenshot:
+                    screenshot_b64 = self.last_screenshot
+                
                 username = random.choice(["PixelPirate", "LagLord", "CopiumDealer", "GGWP_123"])
+                line = llm_generate_line(list(self.recent_chat), username, screenshot_b64)
                 color = random.choice(["#1E90FF", "#32CD32", "#FF4500", "#8A2BE2"])
                 self.recent_chat.append(f"{username}: {line}")
                 self._append_line(username, color, line)
